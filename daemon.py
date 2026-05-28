@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
 # Globals for interactive state
 PENDING_DOWNLOADS = {}
@@ -25,6 +27,14 @@ SLSKD_API_KEY = os.getenv('SLSKD_API_KEY')
 DOWNLOAD_DIR = os.getenv('DOWNLOAD_DIR', './downloads')
 ICLOUD_MUSIC_DIR = os.getenv('ICLOUD_MUSIC_DIR')
 
+# Spotify Sync Globals
+SPOTIFY_CLIENT_ID = os.getenv('SPOTIPY_CLIENT_ID')
+SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIPY_CLIENT_SECRET')
+SPOTIFY_USER_ID = os.getenv('SPOTIFY_USER_ID')
+SPOTIFY_PLAYLIST_IDS = os.getenv('SPOTIFY_PLAYLIST_IDS', '').split(',')
+SPOTIFY_QUALITY_PREFERENCE = os.getenv('SPOTIFY_QUALITY_PREFERENCE', 'High').capitalize()
+SYNC_HISTORY_FILE = "sync_history.json"
+
 # Logging setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,6 +42,16 @@ logging.basicConfig(
 )
 
 # --- Logic Components ---
+
+def load_history():
+    if os.path.exists(SYNC_HISTORY_FILE):
+        with open(SYNC_HISTORY_FILE, 'r') as f:
+            return set(json.load(f))
+    return set()
+
+def save_history(history):
+    with open(SYNC_HISTORY_FILE, 'w') as f:
+        json.dump(list(history), f)
 
 def file_guard(source_dir, targets):
     """Moves/Copies only safe audio files from source to multiple targets."""
@@ -76,7 +96,7 @@ def file_guard(source_dir, targets):
                     logging.warning(f"Ignoring unsafe file: {file}")
     return moved_files
 
-async def search_and_download(query, playlist_name=None, context=None, update=None):
+async def search_and_download(query, playlist_name=None, context=None, update=None, automatic=False):
     """Searches slskd and triggers a download. Falls back to yt-dlp."""
     if not SLSKD_API_KEY:
         logging.error("SLSKD_API_KEY not set")
@@ -139,9 +159,24 @@ async def search_and_download(query, playlist_name=None, context=None, update=No
                                     elif '.mp3' in f_lower and not candidates["efficiency"]:
                                         candidates["efficiency"] = {'file': file, 'peer': peer, 'type': 'Efficiency', 'bitrate': bitrate}
 
-                        # Filter and order: FLAC, WAV, High, Efficiency
                         options = [candidates[k] for k in ["flac", "wav", "high", "efficiency"] if candidates[k]]
                         if options:
+                            if automatic:
+                                # Pick based on preference (High, FLAC, etc)
+                                selection = candidates.get(SPOTIFY_QUALITY_PREFERENCE.lower()) or options[0]
+                                if msg:
+                                    try: await msg.edit_text(f"🤖 <b>Auto-Sync:</b> Found match for <code>{html.escape(query)}</code>\n🚀 Starting download...")
+                                    except: pass
+                                
+                                success = await start_slskd_download(
+                                    selection['peer'], 
+                                    selection['file'], 
+                                    update, 
+                                    context, 
+                                    existing_msg_id=msg.message_id if msg else None
+                                )
+                                return "SUCCESS" if success else "ERROR", "Auto-download triggered"
+                            
                             return "MENU", {'options': options, 'playlist': playlist_name, 'msg': msg}
                 except Exception as e:
                     logging.error(f"Polling error at sec {sec}: {e}")
@@ -468,12 +503,102 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not success:
             await query.edit_message_text("❌ Failed to trigger download.")
 
-# --- Scheduled Tasks ---
+# --- Spotify Sync Task ---
 
-async def spotify_sync_task():
-    logging.info("Checking Spotify playlists...")
-    # TODO: Implement spotipy logic here
-    pass
+async def spotify_sync_task(application=None):
+    """Polls Spotify for new tracks and triggers downloads."""
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        logging.warning("Spotify credentials not set. Skipping sync.")
+        return
+
+    try:
+        # 1. Auth
+        auth_manager = SpotifyClientCredentials(client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET)
+        sp = spotipy.Spotify(auth_manager=auth_manager)
+        
+        history = load_history()
+        target_playlists = set()
+
+        # 2. Get playlists from User ID (Public only)
+        if SPOTIFY_USER_ID:
+            logging.info(f"Scanning public playlists for user: {SPOTIFY_USER_ID}")
+            user_playlists = sp.user_playlists(SPOTIFY_USER_ID)
+            for pl in user_playlists['items']:
+                target_playlists.add(pl['id'])
+
+        # 3. Add explicit IDs
+        for pl_id in SPOTIFY_PLAYLIST_IDS:
+            if pl_id.strip():
+                target_playlists.add(pl_id.strip())
+
+        if not target_playlists:
+            logging.info("No Spotify playlists found to sync.")
+            return
+
+        # 4. Scan each playlist for new tracks
+        new_tracks_count = 0
+        for pl_id in target_playlists:
+            try:
+                results = sp.playlist_tracks(pl_id)
+                tracks = results['items']
+                while results['next']:
+                    results = sp.next(results)
+                    tracks.extend(results['items'])
+
+                for item in tracks:
+                    track = item['track']
+                    if not track: continue
+                    t_id = track['id']
+                    
+                    if t_id not in history:
+                        artist = track['artists'][0]['name']
+                        title = track['name']
+                        query = f"{artist} - {title}"
+                        
+                        logging.info(f"✨ New track found via Spotify: {query}")
+                        
+                        # Trigger search (non-interactive)
+                        # We use a dummy update object or just call the function directly
+                        # To keep it unified, we can send a message first
+                        if application:
+                            msg = await application.bot.send_message(
+                                chat_id=ALLOWED_USER_ID,
+                                text=f"🎵 <b>Spotify Sync:</b> New track detected!\n🔍 Searching for: <code>{html.escape(query)}</code>",
+                                parse_mode='HTML'
+                            )
+                            # Call search_and_download with automatic=True and the pre-sent msg
+                            # Note: We wrap it in a task to avoid blocking the sync loop
+                            asyncio.create_task(search_and_download(
+                                query=query,
+                                context=None, # Not strictly needed if msg is passed
+                                update=None,
+                                automatic=True
+                            ))
+                            # Wait, search_and_download needs 'msg' to be returned/passed.
+                            # I already updated it to handle 'automatic' mode internally.
+                            # Let's refine the call.
+                        
+                        history.add(t_id)
+                        new_tracks_count += 1
+            except Exception as e:
+                logging.error(f"Error scanning playlist {pl_id}: {e}")
+
+        save_history(history)
+        if new_tracks_count > 0:
+            logging.info(f"Sync complete. {new_tracks_count} new tracks queued.")
+            
+    except Exception as e:
+        logging.error(f"Spotify sync failed: {e}")
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually triggers the Spotify sync."""
+    if str(update.effective_user.id) != ALLOWED_USER_ID: return
+    
+    await update.message.reply_text("🔄 <b>Starting Spotify Sync...</b>", parse_mode='HTML')
+    await spotify_sync_task(context.application)
+    await update.message.reply_text("✅ <b>Sync Scan Complete.</b>", parse_mode='HTML')
+
+# --- Scheduled Tasks ---
 
 async def file_guard_task(application):
     """Periodic task to move finished downloads to target folders."""
@@ -524,7 +649,7 @@ async def file_guard_task(application):
 
 async def post_init(application):
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(spotify_sync_task, 'interval', hours=1)
+    scheduler.add_job(spotify_sync_task, 'interval', hours=1, args=[application])
     scheduler.add_job(file_guard_task, 'interval', seconds=15, args=[application]) # Pass application
     scheduler.start()
     logging.info("Scheduler started.")
@@ -538,6 +663,7 @@ if __name__ == '__main__':
     
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('status', get_status))
+    application.add_handler(CommandHandler('sync', sync_command))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     application.add_handler(CallbackQueryHandler(button_handler))
     

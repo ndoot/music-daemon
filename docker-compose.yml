@@ -1,0 +1,24 @@
+services:
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    environment:
+      - SLSKD_REMOTE_CONFIGURATION=true
+      - SLSKD_NO_AUTH=true
+      - SLSKD_SLSK_USERNAME='ndata'
+      - SLSKD_SLSK_PASSWORD='Soulseekbigboy69!'
+      - SLSKD__WEB__AUTHENTICATION__API_KEYS__DAEMON__KEY=0e3409a30c53556fe975cea19e8ea079
+      - SLSKD__WEB__AUTHENTICATION__API_KEYS__DAEMON__ROLE=administrator
+      - SLSKD_DOWNLOADS_DIRECTORY=/app/data/downloads
+      - SLSKD_INCOMPLETE_DIRECTORY=/app/data/incomplete
+    ports:
+      - "5030:5030" # Web UI & API
+      - "5031:5031" # Soulseek Protocol
+    volumes:
+      - ./slskd-data:/app/data
+      - ./slskd-data/downloads:/app/downloads
+      - ./slskd-data/incomplete:/app/incomplete
+    restart: unless-stopped
+
+  # The bridge will be run locally via venv for easier debugging/access to iCloud
+  # but we can dockerize it later if needed.

@@ -1,3 +1,5 @@
+slskd-data/
+downloads/
 .DS_Store
 __pycache__/
 *.log

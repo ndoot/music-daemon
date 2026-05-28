@@ -1,0 +1,5 @@
+python-telegram-bot
+spotipy
+requests
+python-dotenv
+apscheduler
